@@ -13,7 +13,7 @@
 namespace ws2812 {
 const uint8_t byte = 8;
 const uint8_t color_num = 3;
-const uint8_t pixel_num = 2;
+const uint8_t pixel_num = 8;
 const uint8_t data_len = byte * color_num * pixel_num;
 const uint8_t reset_bit = 1;
 
