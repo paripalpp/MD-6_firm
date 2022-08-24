@@ -124,16 +124,88 @@ int main(void)
   const ws2812::color _white = {12, 16, 32};
   const ws2812::color _full = {255, 255, 255};
 
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
-  HAL_TIM_PWM_Start(&htim15, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim15, TIM_CHANNEL_2);
+  const struct{
+    TIM_HandleTypeDef *htim;
+    uint32_t channel1;
+    uint32_t channel2;
+  } motor_tim[] = {
+    {&htim2, TIM_CHANNEL_1, TIM_CHANNEL_2},
+    {&htim2, TIM_CHANNEL_3, TIM_CHANNEL_4},
+    {&htim3, TIM_CHANNEL_1, TIM_CHANNEL_2},
+    {&htim3, TIM_CHANNEL_3, TIM_CHANNEL_4},
+    {&htim15, TIM_CHANNEL_1, TIM_CHANNEL_2},
+  };
+  for (int i = 0; i < 5; i++)
+  {
+    HAL_TIM_PWM_Start(motor_tim[i].htim, motor_tim[i].channel1);
+    HAL_TIM_PWM_Start(motor_tim[i].htim, motor_tim[i].channel2);
+  }
+
+  //note : 	subscribe control messages for stm_CAN::FIFO::_0
+  //		subscribe data message for stm_CAN::FIFO::_1
+  //		control message : 	0x00 (ext) and original ID (ext)
+  //		data message    :	initialized and added from control message
+  const uint32_t original_id = 0x0100;
+  can.subscribe_message(0x00, stm_CAN::ID_type::ext, stm_CAN::Frame_type::data, stm_CAN::FIFO::_0);
+  can.subscribe_message(original_id, stm_CAN::ID_type::ext, stm_CAN::Frame_type::data, stm_CAN::FIFO::_0);
+
+  enum state{
+    STATE_RUNNING,
+    STATE_STOPPED,
+  } state = STATE_STOPPED;
+  uint32_t read_id[] = {0, 0};
+  int16_t motor_output[] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+  auto write_motor = [&](){
+    auto clamp_unsigned = [](int16_t v){return (v > 0)? v : 0;};
+    for (int i = 0; i < 5; i++){
+      __HAL_TIM_SET_COMPARE(motor_tim[i].htim, motor_tim[i].channel1, clamp_unsigned(motor_output[i]) << 1);
+      __HAL_TIM_SET_COMPARE(motor_tim[i].htim, motor_tim[i].channel2, clamp_unsigned(-motor_output[i]) << 1);
+    }
+    
+    static uint16_t spi_datas[] = {0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000};
+    for(int i = 0; i < 3; i++){
+      spi_datas[i*2+1] = clamp_unsigned(motor_output[i + 5]) << 1;
+      spi_datas[i*2+2] = clamp_unsigned(-motor_output[i + 5]) << 1;
+    }
+    HAL_SPI_Transmit_DMA(&hspi1, (uint8_t *)&spi_datas, 7);
+  };
+
+  auto process_data = [&](uint8_t* data){
+    switch (data[0])
+      {
+      case 0x00:  //who am i
+        can.send(original_id, stm_CAN::ID_type::ext, stm_CAN::Frame_type::data, data, 0);
+        break;
+      case 0x01:  //hardware reset
+        HAL_NVIC_SystemReset();
+        break;
+      case 0x02:  //set state
+        if (data[1] == 0x00){
+          state = STATE_STOPPED;
+        }
+        else if (data[1] == 0x01){
+          state = STATE_RUNNING;
+        }
+        break;
+      case 0x03:  //set recieve id
+        can.subscribe_message(data[1] | (data[2] << 8), stm_CAN::ID_type::std, stm_CAN::Frame_type::data, stm_CAN::FIFO::_1);
+        can.subscribe_message(data[3] | (data[4] << 8), stm_CAN::ID_type::std, stm_CAN::Frame_type::data, stm_CAN::FIFO::_1);
+        read_id[0] = data[1] | (data[2] << 8);
+        read_id[1] = data[3] | (data[4] << 8);
+        break;
+      case 0xff:  //API specify command
+        //0~7 :   set pwm
+        if(data[1] < 8 && state == STATE_RUNNING){
+          motor_output[data[1]] = data[2] | (data[3] << 8);
+        }
+        break;
+      
+      default:
+        break;
+      }
+    return;
+  };
 
   /* USER CODE END 2 */
 
@@ -141,11 +213,58 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    __HAL_TIM_SetCompare(&htim2, TIM_CHANNEL_1, 0x2000);
-    __HAL_TIM_SetCompare(&htim2, TIM_CHANNEL_2, 0);
+    uint8_t data[] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (can.read(stm_CAN::FIFO::_0, data)){
+      process_data(data);
+    }
     for (int i = 0; i < 8; i++)
     {
-      pixels.colors[i] = _white;
+      data[i] = 0;
+    }
+    
+    CAN_RxHeaderTypeDef header;
+    if (can.read(stm_CAN::FIFO::_1, data, &header)){
+      if (header.StdId == read_id[0]){
+        for(int i = 0; i < 4; i++){
+          motor_output[i] = data[i*2] | (data[i*2+1] << 8);
+        }
+      }else if (header.StdId == read_id[1]){
+        for(int i = 0; i < 4; i++){
+          motor_output[i] = data[i*2] | (data[i*2+1] << 8);
+        }
+      }else{break;}
+    }
+    if(state == STATE_STOPPED){
+      for(int i = 0; i < 8; i++){
+        motor_output[i] = 0;
+      }
+    }
+    write_motor();
+      
+    // motor output test
+    // motor_output[0] = 16383;
+    // motor_output[1] = -16383;
+    // motor_output[2] = 16383;
+    // motor_output[3] = -16383;
+    // motor_output[4] = 16383;
+    // motor_output[5] = -16383;
+    // motor_output[6] = 16383;
+    // motor_output[7] = -16383;
+    // write_motor();
+    
+    for (int i = 0; i < 8; i++)
+    {
+      if(state == STATE_RUNNING){
+        if(motor_output[i] == 0){
+          pixels.colors[i] = _white;
+        }else if (motor_output[i] > 0){
+          pixels.colors[i] = _blue;
+        }else{
+          pixels.colors[i] = _orenge;
+        }
+      }else{
+        pixels.colors[i] = _purple;
+      }
     }
     pixels.rend();
 
